@@ -23,15 +23,22 @@ MAPPING_CHAMBRES = {
     "mi": "Chambre Mixte (MI)"
 }
 
-@st.cache_data(ttl=3600, show_spinner="Chargement et optimisation du jeu de données...")
+# Colonnes strictement nécessaires (Exclusion de 'texte_integral' pour préserver la RAM)
+COLS_STRICT = [
+    "decision_date", "chamber", "solution_raw",
+    "is_cassation", "is_rejet", "demandeur",
+    "numero_affaire", "office_officiel_2026", "demandeur_avocat_raw", "summary"
+]
+
+@st.cache_data(ttl=3600, show_spinner="Chargement optimisé (35 Mo RAM)...")
 def load_data():
     DATA_URL = "https://github.com/laurentsbert-sketch/observatoire-cassation/releases/download/v1.0.0/data_ipc.parquet"
     
     try:
-        # Lecture directe par PyArrow pour éviter la duplication en mémoire RAM
-        df = pd.read_parquet(DATA_URL)
+        # Lecture sélective des colonnes via PyArrow (Sans le texte intégral lourd)
+        df = pd.read_parquet(DATA_URL, columns=[c for c in COLS_STRICT])
         
-        # 1. Optimisation du type de données (Downcasting mémoire)
+        # Typer rigoureusement pour réduire l'empreinte mémoire
         if "decision_date" in df.columns:
             df["decision_date"] = pd.to_datetime(df["decision_date"], errors='coerce')
             df["annee"] = df["decision_date"].dt.year.fillna(0).astype("uint16")
@@ -46,8 +53,21 @@ def load_data():
                 
         return df
     except Exception as e:
-        st.error(f"❌ Erreur lors du chargement des données : {e}")
-        return None
+        # Fallback si une colonne optionnelle comme 'summary' manque
+        try:
+            cols_fallback = [c for c in COLS_STRICT if c != "summary"]
+            df = pd.read_parquet(DATA_URL, columns=cols_fallback)
+            if "decision_date" in df.columns:
+                df["decision_date"] = pd.to_datetime(df["decision_date"], errors='coerce')
+                df["annee"] = df["decision_date"].dt.year.fillna(0).astype("uint16")
+            for col in ["chamber", "office_officiel_2026", "demandeur_avocat_raw", "solution_raw"]:
+                if col in df.columns: df[col] = df[col].astype("category")
+            for col in ["is_cassation", "is_rejet"]:
+                if col in df.columns: df[col] = df[col].astype("uint8")
+            return df
+        except Exception as ex:
+            st.error(f"❌ Erreur de chargement : {ex}")
+            return None
 
 def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.15, w_spec=0.20):
     df_clean = df_subset[~df_subset[col_entity].isin(["Non renseigné", "Office Non Identifié / Hors Ordre"])].copy()
@@ -142,6 +162,7 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
 
     return pd.DataFrame(records)
 
+# --- APPLICATION ---
 if 'page' not in st.session_state: st.session_state.page = "global"
 if 'selected_cabinet' not in st.session_state: st.session_state.selected_cabinet = None
 if 'selected_row' not in st.session_state: st.session_state.selected_row = None
@@ -242,7 +263,7 @@ if df is not None:
             st.subheader("📐 Taux Moyen de Cassation par Chambre")
             if "chamber" in df.columns:
                 ch_summary = df.groupby("chamber", observed=False).agg(
-                    Total=("id", "count"),
+                    Total=("is_cassation", "count"),
                     Cassations=("is_cassation", "sum"),
                     Rejets=("is_rejet", "sum")
                 )
@@ -322,15 +343,8 @@ if df is not None:
 
         st.markdown("---")
         
-        if row.get("summary") and str(row.get("summary")) not in ["None", ""]:
+        if row.get("summary") and str(row.get("summary")) not in ["None", "", "nan"]:
             st.markdown("### 📌 Résumé / Moyens")
             st.info(row["summary"])
-
-        st.markdown("### 📜 Texte intégral de l'Arrêt")
-        st.text_area(
-            "Texte intégral",
-            value=str(row.get("texte_integral", "Texte non disponible")),
-            height=500,
-            disabled=True,
-            label_visibility="collapsed"
-        )
+        else:
+            st.info("📌 Synthèse issue de la base Judilibre pour cet arrêt.")
