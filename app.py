@@ -1,7 +1,5 @@
 import os
 import re
-import io
-import urllib.request
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -25,30 +23,30 @@ MAPPING_CHAMBRES = {
     "mi": "Chambre Mixte (MI)"
 }
 
-@st.cache_data
+@st.cache_data(ttl=3600, show_spinner="Chargement et optimisation du jeu de données...")
 def load_data():
     DATA_URL = "https://github.com/laurentsbert-sketch/observatoire-cassation/releases/download/v1.0.0/data_ipc.parquet"
     
     try:
-        req = urllib.request.Request(DATA_URL, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            parquet_bytes = io.BytesIO(response.read())
-            
-        df = pd.read_parquet(parquet_bytes)
+        # Lecture directe par PyArrow pour éviter la duplication en mémoire RAM
+        df = pd.read_parquet(DATA_URL)
         
+        # 1. Optimisation du type de données (Downcasting mémoire)
         if "decision_date" in df.columns:
             df["decision_date"] = pd.to_datetime(df["decision_date"], errors='coerce')
-            df["annee"] = df["decision_date"].dt.year
+            df["annee"] = df["decision_date"].dt.year.fillna(0).astype("uint16")
             
-        if "office_officiel_2026" not in df.columns:
-            df["office_officiel_2026"] = df.get("demandeur_avocat", "Non renseigné")
-        if "demandeur_avocat_raw" not in df.columns:
-            df["demandeur_avocat_raw"] = df.get("demandeur_avocat", "Non renseigné")
-            
+        for col in ["chamber", "office_officiel_2026", "demandeur_avocat_raw", "solution_raw"]:
+            if col in df.columns:
+                df[col] = df[col].astype("category")
+                
+        for col in ["is_cassation", "is_rejet"]:
+            if col in df.columns:
+                df[col] = df[col].astype("uint8")
+                
         return df
     except Exception as e:
-        st.error(f"❌ Erreur lors du chargement des données depuis la Release GitHub : {e}")
-        st.info("💡 Vérifiez que le tag 'v1.0.0' et le fichier 'data_ipc.parquet' existent bien dans vos Releases GitHub.")
+        st.error(f"❌ Erreur lors du chargement des données : {e}")
         return None
 
 def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.15, w_spec=0.20):
@@ -58,7 +56,7 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
 
     df_fond_global = df_subset[df_subset["chamber"] != "ordo"]
     
-    ch_tranche = df_fond_global.groupby("chamber").agg(
+    ch_tranche = df_fond_global.groupby("chamber", observed=False).agg(
         C_tot=("is_cassation", "sum"),
         R_tot=("is_rejet", "sum")
     )
@@ -66,10 +64,13 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
     avg_ch_map = ch_tranche["T_ch_avg"].to_dict()
 
     records = []
-    max_N = df_clean.groupby(col_entity).size().max() or 1
+    max_N = df_clean.groupby(col_entity, observed=False).size().max() or 1
 
-    for entity, group in df_clean.groupby(col_entity):
+    for entity, group in df_clean.groupby(col_entity, observed=False):
         N_c = len(group)
+        if N_c == 0:
+            continue
+            
         group_fond = group[group["chamber"] != "ordo"]
         N_fond = len(group_fond)
         
@@ -81,7 +82,7 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
 
         if tranches > 0:
             delta_sum = 0.0
-            for ch, ch_group in group_fond.groupby("chamber"):
+            for ch, ch_group in group_fond.groupby("chamber", observed=False):
                 c_ch = ch_group["is_cassation"].sum()
                 r_ch = ch_group["is_rejet"].sum()
                 t_ch = c_ch + r_ch
@@ -94,7 +95,7 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
             I_perf = 0.0
 
         yearly_rates = []
-        for yr, yr_group in group_fond.groupby("annee"):
+        for yr, yr_group in group_fond.groupby("annee", observed=False):
             c_y = yr_group["is_cassation"].sum()
             r_y = yr_group["is_rejet"].sum()
             if (c_y + r_y) > 0:
@@ -113,7 +114,7 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
             K = 6.0
             I_spec = round(float(np.clip(100.0 * (hhi - (1.0 / K)) / (1.0 - (1.0 / K)), 0.0, 100.0)), 1)
             top_ch = ch_counts.index[0]
-            top_ch_name = MAPPING_CHAMBRES.get(top_ch, top_ch)
+            top_ch_name = MAPPING_CHAMBRES.get(str(top_ch), str(top_ch))
         else:
             I_spec = 0.0
             top_ch_name = "Ordonnances Exclusives"
@@ -124,7 +125,7 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
         marge_err = round(1.96 * np.sqrt((tx_fond/100 * (1 - tx_fond/100)) / max(1, tranches)) * 100, 1) if tranches > 0 else 0.0
 
         records.append({
-            col_entity: entity,
+            col_entity: str(entity),
             "Score IPC Global": score_ipc,
             "Total Pourvois": N_c,
             "Tranchés au Fond": tranches,
@@ -167,7 +168,7 @@ if df is not None:
             if isinstance(dates, tuple) and len(dates) == 2:
                 df = df[(df[col_date].dt.date >= dates[0]) & (df[col_date].dt.date <= dates[1])]
         else:
-            annees_dispos = sorted([int(y) for y in df["annee"].dropna().unique()])
+            annees_dispos = sorted([int(y) for y in df["annee"].unique() if y > 0])
             annees_sel = st.sidebar.multiselect("Années", annees_dispos, default=annees_dispos)
             if annees_sel:
                 df = df[df["annee"].isin(annees_sel)]
@@ -228,7 +229,7 @@ if df is not None:
             df_dem = df[mask_real_dem]
             seuil_dem = st.slider("Seuil minimum de pourvois", 1, 100, 10, key="slider_dem")
             
-            stats_dem = df_dem.groupby("demandeur").agg(
+            stats_dem = df_dem.groupby("demandeur", observed=False).agg(
                 Total_Pourvois=("is_cassation", "count"),
                 Cassations=("is_cassation", "sum"),
                 Rejets=("is_rejet", "sum")
@@ -240,13 +241,13 @@ if df is not None:
         with tab_ch:
             st.subheader("📐 Taux Moyen de Cassation par Chambre")
             if "chamber" in df.columns:
-                ch_summary = df.groupby("chamber").agg(
+                ch_summary = df.groupby("chamber", observed=False).agg(
                     Total=("id", "count"),
                     Cassations=("is_cassation", "sum"),
                     Rejets=("is_rejet", "sum")
                 )
                 ch_summary["Taux au Fond (%)"] = round((ch_summary["Cassations"] / (ch_summary["Cassations"] + ch_summary["Rejets"])) * 100, 1)
-                ch_summary.index = ch_summary.index.map(lambda x: MAPPING_CHAMBRES.get(x, x))
+                ch_summary.index = ch_summary.index.map(lambda x: MAPPING_CHAMBRES.get(str(x), str(x)))
                 st.dataframe(ch_summary.sort_values("Total", ascending=False), width="stretch", height=450)
 
     elif st.session_state.page == "cabinet":
@@ -315,7 +316,7 @@ if df is not None:
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Date", str(row.get("decision_date", ""))[:10])
-        c2.metric("Chambre", MAPPING_CHAMBRES.get(row.get("chamber"), row.get("chamber")))
+        c2.metric("Chambre", MAPPING_CHAMBRES.get(str(row.get("chamber")), str(row.get("chamber"))))
         c3.metric("Demandeur", str(row.get("demandeur", "Non renseigné")))
         c4.metric("Issue", str(row.get("solution_raw", "")))
 
