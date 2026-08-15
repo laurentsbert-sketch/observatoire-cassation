@@ -201,7 +201,7 @@ if df is not None:
                 df_ipc_filt = df_ipc[df_ipc["Total Pourvois"] >= seuil_min].sort_values("Score IPC Global", ascending=False)
                 
                 st.write("💡 *Cliquez sur une ligne pour ouvrir la fiche synthétique du cabinet :*")
-                event = st.dataframe(df_ipc_filt, use_container_width=True, selection_mode="single-row", on_select="rerun", height=450)
+                event = st.dataframe(df_ipc_filt, width="stretch", selection_mode="single-row", on_select="rerun", height=450)
                 
                 if event.selection["rows"]:
                     idx = event.selection["rows"][0]
@@ -216,7 +216,7 @@ if df is not None:
             df_raw = compute_ipc_scores(df, "demandeur_avocat_raw", w_act, w_perf, w_reg, w_spec)
             if not df_raw.empty:
                 df_raw_filt = df_raw[df_raw["Total Pourvois"] >= seuil_raw].sort_values("Total Pourvois", ascending=False)
-                st.dataframe(df_raw_filt, use_container_width=True, height=450)
+                st.dataframe(df_raw_filt, width="stretch", height=450)
 
         with tab_dem:
             st.subheader("🏛️ Demandeurs Récurrents Non Anonymisés")
@@ -235,7 +235,7 @@ if df is not None:
             )
             stats_dem["Taux au Fond (%)"] = round((stats_dem["Cassations"] / (stats_dem["Cassations"] + stats_dem["Rejets"])) * 100, 1)
             stats_dem = stats_dem[stats_dem["Total_Pourvois"] >= seuil_dem].sort_values("Total_Pourvois", ascending=False)
-            st.dataframe(stats_dem, use_container_width=True, height=450)
+            st.dataframe(stats_dem, width="stretch", height=450)
 
         with tab_ch:
             st.subheader("📐 Taux Moyen de Cassation par Chambre")
@@ -247,7 +247,7 @@ if df is not None:
                 )
                 ch_summary["Taux au Fond (%)"] = round((ch_summary["Cassations"] / (ch_summary["Cassations"] + ch_summary["Rejets"])) * 100, 1)
                 ch_summary.index = ch_summary.index.map(lambda x: MAPPING_CHAMBRES.get(x, x))
-                st.dataframe(ch_summary.sort_values("Total", ascending=False), use_container_width=True, height=450)
+                st.dataframe(ch_summary.sort_values("Total", ascending=False), width="stretch", height=450)
 
     elif st.session_state.page == "cabinet":
         cab = st.session_state.selected_cabinet
@@ -289,7 +289,7 @@ if df is not None:
             
             event_dec = st.dataframe(
                 df_cab[cols_present].sort_values("decision_date", ascending=False), 
-                use_container_width=True, 
+                width="stretch", 
                 selection_mode="single-row", 
                 on_select="rerun",
                 height=400
