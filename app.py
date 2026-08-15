@@ -25,11 +25,16 @@ MAPPING_CHAMBRES = {
 
 @st.cache_data
 def load_data():
-    parquet_path = "data_ipc.parquet"
-    if not os.path.exists(parquet_path):
-        parquet_path = "/content/drive/MyDrive/Judilibre_Analysis/data_ipc.parquet"
-        if not os.path.exists(parquet_path):
-            parquet_path = "data.parquet"
+    DATA_URL = "https://github.com/laurentsbert-sketch/observatoire-cassation/releases/download/v1.0.0/data_ipc.parquet"
+    try:
+        df = pd.read_parquet(DATA_URL)
+        if "decision_date" in df.columns:
+            df["decision_date"] = pd.to_datetime(df["decision_date"], errors='coerce')
+            df["annee"] = df["decision_date"].dt.year
+        return df
+    except Exception as e:
+        st.error(f"Erreur de chargement des données : {e}")
+        return None
             
     if os.path.exists(parquet_path):
         df = pd.read_parquet(parquet_path)
