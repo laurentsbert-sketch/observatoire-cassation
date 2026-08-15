@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import urllib.request
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -26,39 +28,36 @@ MAPPING_CHAMBRES = {
 @st.cache_data
 def load_data():
     DATA_URL = "https://github.com/laurentsbert-sketch/observatoire-cassation/releases/download/v1.0.0/data_ipc.parquet"
+    
     try:
-        df = pd.read_parquet(DATA_URL)
-        if "decision_date" in df.columns:
-            df["decision_date"] = pd.to_datetime(df["decision_date"], errors='coerce')
-            df["annee"] = df["decision_date"].dt.year
-        return df
-    except Exception as e:
-        st.error(f"Erreur de chargement des données : {e}")
-        return None
+        req = urllib.request.Request(DATA_URL, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            parquet_bytes = io.BytesIO(response.read())
             
-    if os.path.exists(parquet_path):
-        df = pd.read_parquet(parquet_path)
+        df = pd.read_parquet(parquet_bytes)
+        
         if "decision_date" in df.columns:
             df["decision_date"] = pd.to_datetime(df["decision_date"], errors='coerce')
             df["annee"] = df["decision_date"].dt.year
             
         if "office_officiel_2026" not in df.columns:
-            df["office_officiel_2026"] = df["demandeur_avocat"]
+            df["office_officiel_2026"] = df.get("demandeur_avocat", "Non renseigné")
         if "demandeur_avocat_raw" not in df.columns:
-            df["demandeur_avocat_raw"] = df["demandeur_avocat"]
+            df["demandeur_avocat_raw"] = df.get("demandeur_avocat", "Non renseigné")
             
         return df
-    return None
+    except Exception as e:
+        st.error(f"❌ Erreur lors du chargement des données depuis la Release GitHub : {e}")
+        st.info("💡 Vérifiez que le tag 'v1.0.0' et le fichier 'data_ipc.parquet' existent bien dans vos Releases GitHub.")
+        return None
 
 def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.15, w_spec=0.20):
     df_clean = df_subset[~df_subset[col_entity].isin(["Non renseigné", "Office Non Identifié / Hors Ordre"])].copy()
     if df_clean.empty:
         return pd.DataFrame()
 
-    # Isolement des décisions au fond uniquement (hors ordonnances) pour la performance et spécialisation
     df_fond_global = df_subset[df_subset["chamber"] != "ordo"]
     
-    # Taux moyen national par chambre au fond
     ch_tranche = df_fond_global.groupby("chamber").agg(
         C_tot=("is_cassation", "sum"),
         R_tot=("is_rejet", "sum")
@@ -78,10 +77,8 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
         rejet = group["is_rejet"].sum()
         tranches = cass + rejet
         
-        # 1. Indice d'Activité
         I_act = round(min(100.0, 100.0 * (np.log(1 + N_c) / np.log(1 + max_N))), 1)
 
-        # 2. Indice de Performance (Calculé uniquement au fond)
         if tranches > 0:
             delta_sum = 0.0
             for ch, ch_group in group_fond.groupby("chamber"):
@@ -94,9 +91,8 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
                     delta_sum += (len(ch_group) / max(1, N_fond)) * (rate_c_ch - avg_ref)
             I_perf = round(float(np.clip(50.0 + 200.0 * delta_sum, 0.0, 100.0)), 1)
         else:
-            I_perf = 0.0  # Penalisation si 0 affaire au fond
+            I_perf = 0.0
 
-        # 3. Indice de Régularité (Variance interannuelle au fond)
         yearly_rates = []
         for yr, yr_group in group_fond.groupby("annee"):
             c_y = yr_group["is_cassation"].sum()
@@ -111,7 +107,6 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
         else:
             I_reg = 0.0 if tranches == 0 else 50.0
 
-        # 4. Indice de Spécialisation HHI (Exclut la chambre ORDO)
         ch_counts = group_fond["chamber"].value_counts(normalize=True)
         if not ch_counts.empty:
             hhi = np.sum(ch_counts**2)
@@ -123,7 +118,6 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
             I_spec = 0.0
             top_ch_name = "Ordonnances Exclusives"
 
-        # Score Composite IPC
         score_ipc = round(w_act * I_act + w_perf * I_perf + w_reg * I_reg + w_spec * I_spec, 1)
         
         tx_fond = round((cass / tranches) * 100, 1) if tranches > 0 else 0.0
@@ -146,8 +140,7 @@ def compute_ipc_scores(df_subset, col_entity, w_act=0.20, w_perf=0.45, w_reg=0.1
         })
 
     return pd.DataFrame(records)
-    
-# --- APPLICATION PRINCIPALE ---
+
 if 'page' not in st.session_state: st.session_state.page = "global"
 if 'selected_cabinet' not in st.session_state: st.session_state.selected_cabinet = None
 if 'selected_row' not in st.session_state: st.session_state.selected_row = None
@@ -157,22 +150,15 @@ df = load_data()
 st.title("⚖️ Indice de Performance de Cassation (IPC)")
 st.caption("Analyse décisionnelle et transparente des avocats aux Conseils devant la Cour de cassation (2021 - 2026)")
 
-if df is None:
-    st.error("⚠️ Fichier de données introuvable. Veuillez exécuter le script Colab d'enrichissement.")
-else:
+if df is not None:
     col_date = "decision_date"
 
-    # ==========================================
-    # BARRE LATÉRALE : FILTRES & PONDÉRATIONS
-    # ==========================================
     st.sidebar.header("🎛️ Filtres Temporels & Périmètre")
     
-    # 1. Option Ordonnances
-    exclure_ordo = st.sidebar.checkbox("🚫 Exclure les Ordonnances (`ordo`)", value=False)
+    exclure_ordo = st.sidebar.checkbox("🚫 Exclure la chambre Ordonnances (`ordo`)", value=False)
     if exclure_ordo:
         df = df[df["chamber"] != "ordo"]
 
-    # 2. Filtre par Date
     if col_date in df.columns and not df[col_date].isna().all():
         type_filtre_date = st.sidebar.radio("Filtrage temporel", ["Plage de dates (Précis)", "Par Années"])
         if type_filtre_date == "Plage de dates (Précis)":
@@ -186,7 +172,6 @@ else:
             if annees_sel:
                 df = df[df["annee"].isin(annees_sel)]
 
-    # 3. Pondérations IPC
     st.sidebar.markdown("---")
     st.sidebar.subheader("⚙️ Pondérations de l'Indice IPC")
     w_perf = st.sidebar.slider("Performance Contextualisée", 0.0, 1.0, 0.45, 0.05)
@@ -194,13 +179,9 @@ else:
     w_spec = st.sidebar.slider("Spécialisation (HHI)", 0.0, 1.0, 0.20, 0.05)
     w_reg = st.sidebar.slider("Régularité", 0.0, 1.0, 0.15, 0.05)
     
-    # Normalisation des poids
     w_sum = w_perf + w_act + w_spec + w_reg or 1.0
     w_perf, w_act, w_spec, w_reg = w_perf/w_sum, w_act/w_sum, w_spec/w_sum, w_reg/w_sum
 
-    # ==========================================
-    # PAGES & NAVIGATION
-    # ==========================================
     if st.session_state.page == "global":
         
         tab_norm, tab_raw, tab_dem, tab_ch = st.tabs([
@@ -210,11 +191,8 @@ else:
             "📐 Benchmarks Chambres"
         ])
 
-        # --- ONGLET 1 : OFFICES NORMÉS IPC 2026 ---
         with tab_norm:
-            st.subheader("🏆 Classement des Offices d'Avocats aux Conseils (Annuaire 2026)")
-            st.caption("Données réalignées sur les 60 offices officiels et calculées selon le modèle composite IPC.")
-            
+            st.subheader("🏆 Classement des Offices d'Avocats aux Conseils (Annuaire Ordinal 2026)")
             seuil_min = st.slider("Seuil minimum de pourvois", 1, 200, 15, key="slider_norm")
             
             df_ipc = compute_ipc_scores(df, "office_officiel_2026", w_act, w_perf, w_reg, w_spec)
@@ -222,8 +200,8 @@ else:
             if not df_ipc.empty:
                 df_ipc_filt = df_ipc[df_ipc["Total Pourvois"] >= seuil_min].sort_values("Score IPC Global", ascending=False)
                 
-                st.write("💡 *Cliquez sur une ligne pour ouvrir la fiche détaillée du cabinet :*")
-                event = st.dataframe(df_ipc_filt, width="stretch", selection_mode="single-row", on_select="rerun", height=450)
+                st.write("💡 *Cliquez sur une ligne pour ouvrir la fiche synthétique du cabinet :*")
+                event = st.dataframe(df_ipc_filt, use_container_width=True, selection_mode="single-row", on_select="rerun", height=450)
                 
                 if event.selection["rows"]:
                     idx = event.selection["rows"][0]
@@ -231,19 +209,15 @@ else:
                     st.session_state.page = "cabinet"
                     st.rerun()
 
-        # --- ONGLET 2 : DONNÉES BRUTES EXTRAITES ---
         with tab_raw:
             st.subheader("🔍 Audit & Visualisation des Données Brutes Extraintes")
-            st.caption("Affichage direct des chaînes de caractères brutes extraites des arrêts (sans mappage de dictionnaire).")
-            
             seuil_raw = st.slider("Seuil minimum de pourvois", 1, 200, 15, key="slider_raw")
             
             df_raw = compute_ipc_scores(df, "demandeur_avocat_raw", w_act, w_perf, w_reg, w_spec)
             if not df_raw.empty:
                 df_raw_filt = df_raw[df_raw["Total Pourvois"] >= seuil_raw].sort_values("Total Pourvois", ascending=False)
-                st.dataframe(df_raw_filt, width="stretch", height=450)
+                st.dataframe(df_raw_filt, use_container_width=True, height=450)
 
-        # --- ONGLET 3 : DEMANDEURS INSTITUTIONNELS ---
         with tab_dem:
             st.subheader("🏛️ Demandeurs Récurrents Non Anonymisés")
             mask_real_dem = (
@@ -261,9 +235,8 @@ else:
             )
             stats_dem["Taux au Fond (%)"] = round((stats_dem["Cassations"] / (stats_dem["Cassations"] + stats_dem["Rejets"])) * 100, 1)
             stats_dem = stats_dem[stats_dem["Total_Pourvois"] >= seuil_dem].sort_values("Total_Pourvois", ascending=False)
-            st.dataframe(stats_dem, width="stretch", height=450)
+            st.dataframe(stats_dem, use_container_width=True, height=450)
 
-        # --- ONGLET 4 : CHAMBRES ---
         with tab_ch:
             st.subheader("📐 Taux Moyen de Cassation par Chambre")
             if "chamber" in df.columns:
@@ -274,11 +247,8 @@ else:
                 )
                 ch_summary["Taux au Fond (%)"] = round((ch_summary["Cassations"] / (ch_summary["Cassations"] + ch_summary["Rejets"])) * 100, 1)
                 ch_summary.index = ch_summary.index.map(lambda x: MAPPING_CHAMBRES.get(x, x))
-                st.dataframe(ch_summary.sort_values("Total", ascending=False), width="stretch", height=450)
+                st.dataframe(ch_summary.sort_values("Total", ascending=False), use_container_width=True, height=450)
 
-    # ==========================================
-    # PAGE 2 : FICHE CABINET DÉTAILLÉE
-    # ==========================================
     elif st.session_state.page == "cabinet":
         cab = st.session_state.selected_cabinet
         
@@ -304,8 +274,7 @@ else:
 
             st.markdown("---")
             
-            # Affichage des sous-indices
-            st.markdown("### 📊 Sous-Indices de Performance")
+            st.markdown("### 📊 Sous-Indices de Performance Contextualisée")
             col_i1, col_i2, col_i3, col_i4 = st.columns(4)
             col_i1.progress(row_s['Indice Performance'] / 100.0, text=f"Performance: {row_s['Indice Performance']}")
             col_i2.progress(row_s['Indice Activité'] / 100.0, text=f"Activité: {row_s['Indice Activité']}")
@@ -320,7 +289,7 @@ else:
             
             event_dec = st.dataframe(
                 df_cab[cols_present].sort_values("decision_date", ascending=False), 
-                width="stretch", 
+                use_container_width=True, 
                 selection_mode="single-row", 
                 on_select="rerun",
                 height=400
@@ -332,9 +301,6 @@ else:
                 st.session_state.page = "decision"
                 st.rerun()
 
-    # ==========================================
-    # PAGE 3 : LECTEUR DE DÉCISION
-    # ==========================================
     elif st.session_state.page == "decision":
         col_back, col_title = st.columns([1, 5])
         with col_back:
